@@ -12,7 +12,7 @@ Aplicación de Streamlit para la generación de informes regionales utilizando G
 
 1. Clona el repositorio:
    ```bash
-   git clone https://github.com/Sebasq17/informe-diario-regional.git
+   git clone https://github.com/SebasQuintero17/informe-diario-regional.git
    ```
 2. Instala las dependencias:
    ```bash
