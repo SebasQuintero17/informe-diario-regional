@@ -10,11 +10,12 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 import json, re, io, time, unicodedata
 
 st.set_page_config(
     page_title="Informe Diario Regional | Comfenalco",
-    page_icon="🛡️",
+    page_icon="https://i.imgur.com/RFdkaOo.png",
     layout="wide",
 )
 
@@ -60,6 +61,7 @@ MEDIOS_REGIONALES = [
     "teleantioquia.co", "minuto30.com", "diarioriente.com",
     "hsbnoticias.com", "extra.com.co", "colombiainforma.info",
     "contagioradio.com", "elmundo.com",
+    "h13n.com", "conexionsur.co", "alerta.com.co",
 ]
 
 # Lista completa para Tavily (include_domains) — unión deduplicada
@@ -88,6 +90,73 @@ TIER_BADGE = {
     TRUST_REGIONAL: ("REGIONAL",  "#64748b"),
 }
 
+# Mapping dominio → nombre legible del medio.
+# Critical: para que "Fuente: X" en el texto SIEMPRE corresponda a una URL real.
+MEDIO_NOMBRE = {
+    # Oficiales
+    "alertastempranas.defensoria.gov.co": "Defensoría — Alertas Tempranas",
+    "defensoria.gov.co":   "Defensoría del Pueblo",
+    "policia.gov.co":      "Policía Nacional",
+    "invias.gov.co":       "INVÍAS",
+    "invias-viajero.vercel.app": "INVÍAS Viajero",
+    "mindefensa.gov.co":   "Ministerio de Defensa",
+    "antioquia.gov.co":    "Gobernación de Antioquia",
+    "gobantioquia.gov.co": "Gobernación de Antioquia",
+    "medellin.gov.co":     "Alcaldía de Medellín",
+    "ideam.gov.co":        "IDEAM",
+    "ungrd.gov.co":        "UNGRD",
+    "minenergia.gov.co":   "Min. de Energía",
+    "fiscalia.gov.co":     "Fiscalía General",
+    "presidencia.gov.co":  "Presidencia",
+    "mintransporte.gov.co": "Min. de Transporte",
+    "procuraduria.gov.co": "Procuraduría",
+    "epm.com.co":          "EPM",
+    # Nacionales
+    "elcolombiano.com":         "El Colombiano",
+    "eltiempo.com":             "El Tiempo",
+    "semana.com":               "Semana",
+    "noticias.caracoltv.com":   "Noticias Caracol",
+    "caracol.com.co":           "Caracol Radio",
+    "rcnradio.com":             "RCN Radio",
+    "elespectador.com":         "El Espectador",
+    "lafm.com.co":              "La FM",
+    "bluradio.com":             "Blu Radio",
+    "wradio.com.co":            "W Radio",
+    "vanguardia.com":           "Vanguardia",
+    "elheraldo.co":             "El Heraldo",
+    "elmundo.com":              "El Mundo",
+    "elpais.com.co":            "El País Cali",
+    "publimetro.co":            "Publimetro",
+    "infobae.com":              "Infobae",
+    # Regionales
+    "teleantioquia.co":         "Teleantioquia",
+    "minuto30.com":             "Minuto30",
+    "diarioriente.com":         "Diariente",
+    "h13n.com":                 "H13 Noticias",
+    "conexionsur.co":           "Conexión Sur",
+    "alerta.com.co":            "Alerta Paisa",
+    "hsbnoticias.com":          "HSB Noticias",
+    "extra.com.co":             "Extra",
+    "colombiainforma.info":     "Colombia Informa",
+    "contagioradio.com":        "Contagio Radio",
+}
+
+def nombre_medio(url: str) -> str:
+    """Devuelve el nombre legible del medio dado un URL. Si no matchea, intenta
+    extraer el dominio. Crítico para que el LLM cite fuentes verídicas."""
+    if not url:
+        return "Fuente desconocida"
+    u = url.lower()
+    # Match dominios más largos primero (subdominios específicos antes que el genérico)
+    for dom in sorted(MEDIO_NOMBRE, key=len, reverse=True):
+        if dom in u:
+            return MEDIO_NOMBRE[dom]
+    m = re.search(r"https?://(?:www\.)?([^/]+)", u)
+    if m:
+        host = m.group(1)
+        return host.split(".")[0].capitalize()
+    return "Fuente"
+
 COLORES_EXCEL = {
     "GRAVES":     "FF0000",
     "RELEVANTES": "FFC000",
@@ -103,6 +172,18 @@ LABELS_CRIT = {
 }
 
 SEMAFORO = {"GRAVES": "🔴", "RELEVANTES": "🟠", "PARCIALES": "🟡", "NINGUNA": "🟢"}
+
+# Reemplazo profesional del semáforo emoji: punto de color CSS + pill tipográfica.
+_CRIT_SLUG = {"GRAVES": "graves", "RELEVANTES": "relevantes", "PARCIALES": "parciales", "NINGUNA": "ninguna"}
+
+def dot(crit: str) -> str:
+    """Punto de estado coloreado (HTML) según criticidad."""
+    return f'<span class="sdot sdot-{_CRIT_SLUG.get(crit, "ninguna")}"></span>'
+
+def pill(crit: str) -> str:
+    """Pill tipográfica con la etiqueta de criticidad."""
+    slug = _CRIT_SLUG.get(crit, "ninguna")
+    return f'<span class="crit-pill pill-{slug}">{LABELS_CRIT.get(crit, "")}</span>'
 
 # Mapeo para fecha en español
 DIAS = ["LUNES", "MARTES", "MIÉRCOLES", "JUEVES", "VIERNES", "SÁBADO", "DOMINGO"]
@@ -183,21 +264,72 @@ def detectar_subregion(texto: str) -> str | None:
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Keywords críticas — boost automático de criticidad y de score
+#  Basadas en el vocabulario REAL de los informes Comfenalco
 # ──────────────────────────────────────────────────────────────────────────────
 KEYWORDS_GRAVES = [
-    "toque de queda", "masacre", "atentado", "ataque armado", "explosion",
-    "desplazamiento masivo", "cierre total", "corte total", "via cerrada",
-    "carretera cerrada", "secuestro", "asesinato", "estado de emergencia",
-    "alerta roja", "asesinados", "victimas",
+    # Orden público — declaraciones formales y hechos extremos
+    "toque de queda", "ley seca", "alerta roja", "estado de emergencia",
+    "masacre", "atentado", "ataque con explosivos", "ataque armado",
+    "ataque sicarial", "sicariato", "carro bomba", "explosion",
+    "desplazamiento masivo", "desplazamiento forzado",
+    "secuestro", "asesinato", "asesinados", "homicidio multiple",
+    "hostigamiento armado", "incursion armada", "paro armado",
+    "consejo de seguridad urgente",
+    # Vías
+    "cierre total", "via cerrada", "carretera cerrada",
+    "perdida total de banca", "colapso de puente",
+    # Servicios
+    "corte total", "vandalizaron",
 ]
 KEYWORDS_RELEVANTES = [
-    "alerta de seguridad", "paro civico", "bloqueo", "amenaza", "atraco",
-    "corte de agua", "corte de energia", "alerta naranja", "consejo de seguridad",
-    "desplazamiento", "extorsion", "hostigamiento", "paro armado",
+    # Orden público
+    "alerta de seguridad", "alerta naranja", "consejo de seguridad",
+    "amenazas a campesinos", "amenazas colectivas", "extorsion",
+    "amenaza", "atraco", "paro civico", "bloqueo",
+    "ajuste de cuentas", "clan del golfo", "el mesa", "eln", "emc",
+    "disidencias", "homicidios", "incremento de homicidios",
+    "desplazamiento", "familias desplazadas",
+    # Vías
+    "cierre parcial", "paso a un carril", "paso restringido",
+    "cierres intermitentes", "perdida parcial de banca", "deslizamiento",
+    "derrumbe", "bloqueo via", "via afectada",
+    # Servicios
+    "corte de agua", "corte de energia", "interrupcion de energia",
+    "interrupcion del servicio", "sin servicio de agua",
+    "afectacion de servicios",
 ]
 KEYWORDS_PARCIALES = [
-    "obra programada", "mantenimiento", "alerta amarilla", "alerta preventiva",
-    "trabajos en la via", "obras en la via",
+    # Marcadores de seguimiento
+    "seguimiento", "continua",
+    # Vías programadas
+    "obra programada", "mantenimiento", "cierres nocturnos",
+    "trabajos en la via", "obras en la via", "obras del metro",
+    "perforacion", "pilotes",
+    # Alertas blandas
+    "alerta amarilla", "alerta preventiva", "creciente del rio",
+]
+
+# Keywords NEGATIVAS — temas que NO le interesan a Comfenalco
+# Si una noticia matchea muchas de estas y pocas críticas → descarta
+KEYWORDS_EXCLUSION = [
+    # Deportes y fútbol
+    "atletico nacional", "independiente medellin", "envigado fc",
+    "liga betplay", "copa libertadores", "futbol", "partido", "gol",
+    "selección colombia", "campeon", "torneo",
+    # Farándula y entretenimiento
+    "farandula", "concierto", "festival", "evento musical", "artista",
+    "feria de las flores", "alumbrado",
+    # Gastronomía / cultura
+    "restaurante", "gastronomia", "receta", "turismo recomendado",
+    # Política nacional sin Antioquia
+    "petro presidente", "congreso de la republica", "reforma tributaria",
+    "reforma pensional", "reforma laboral", "ministro",
+    # Economía/bolsa
+    "bolsa de valores", "dolar hoy", "criptomoneda", "acciones",
+    # Tecnología generica
+    "inteligencia artificial", "chatgpt", "iphone", "android",
+    # Internacional
+    "estados unidos", "europa", "venezuela elecciones", "ucrania",
 ]
 
 def detectar_criticidad_keywords(texto: str) -> str | None:
@@ -212,6 +344,26 @@ def detectar_criticidad_keywords(texto: str) -> str | None:
     if any(k in n for k in KEYWORDS_PARCIALES):
         return "PARCIALES"
     return None
+
+def es_ruido_comfenalco(texto: str) -> bool:
+    """
+    Filtro anti-ruido: descarta noticias que claramente NO le interesan a Comfenalco
+    (deportes, farándula, política nacional sin Antioquia, etc).
+    Solo descarta si:
+      - matchea ≥2 keywords de exclusión, Y
+      - NO matchea ninguna keyword crítica (grave/relevante).
+    Así una noticia de "Atlético Nacional" en un atentado SÍ pasaría.
+    """
+    n = _normalize(texto)
+    if not n:
+        return False
+    hits_exclusion = sum(1 for k in KEYWORDS_EXCLUSION if k in n)
+    if hits_exclusion < 3:
+        return False
+    # Si tiene señales críticas, NO es ruido (puede ser relevante igual)
+    if any(k in n for k in KEYWORDS_GRAVES + KEYWORDS_RELEVANTES):
+        return False
+    return True
 
 def menciona_antioquia(texto: str) -> bool:
     """True si el texto menciona Antioquia o algún municipio antioqueño."""
@@ -255,10 +407,18 @@ def parsear_fecha_publicacion(fecha_pub: str, url: str):
     """Intenta parsear la fecha de publicación. Devuelve datetime o None."""
     if fecha_pub:
         raw = fecha_pub.strip()
+        # 1) ISO (topic="general" suele venir así, p.ej. "2026-05-30")
         try:
             if len(raw) <= 10:
                 return datetime.fromisoformat(raw) + timedelta(hours=23, minutes=59, seconds=59)
             return datetime.fromisoformat(raw[:19])
+        except (ValueError, TypeError):
+            pass
+        # 2) RFC 2822 / HTTP-date (topic="news" devuelve "Sun, 30 Aug 2009 00:00:00 GMT")
+        try:
+            dt = parsedate_to_datetime(raw)
+            if dt is not None:
+                return dt.replace(tzinfo=None)  # naive, para comparar con datetime.now()
         except (ValueError, TypeError):
             pass
     # Fallback: probar desde el URL
@@ -266,196 +426,350 @@ def parsear_fecha_publicacion(fecha_pub: str, url: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CSS
+#  CSS — diseño minimalista, performante. Senior-grade.
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Outfit:wght@600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@500&display=swap');
 
 :root {
     --brand: #008751;
-    --brand-dark: #006a3f;
+    --brand-2: #006a40;
     --brand-light: #BBCE00;
-    --accent: #10b981;
-    --bg-app: #f4f7fa;
-    --bg-card: #ffffff;
-    --text-head: #0f172a;
-    --text-body: #334155;
-    --text-muted: #64748b;
-    --border: #e2e8f0;
-    --radius-lg: 24px;
-    --radius-md: 16px;
-    --shadow-elite: 0 10px 15px -3px rgba(0,0,0,0.04), 0 4px 6px -4px rgba(0,0,0,0.02), 0 20px 25px -5px rgba(0,0,0,0.03);
-    --crit-red:    #ef4444;
-    --crit-orange: #f59e0b;
-    --crit-yellow: #eab308;
-    --crit-green:  #22c55e;
+    --ink-1: #0b1220;
+    --ink-2: #1a2233;
+    --ink-3: #475569;
+    --ink-4: #64748b;
+    --ink-5: #94a3b8;
+    --bg: #fafbfc;
+    --card: #ffffff;
+    --line: #eef0f3;
+    --line-2: #e4e7ec;
+    --r-lg: 20px;
+    --r-md: 14px;
+    --r-sm: 10px;
+    --sh-1: 0 1px 2px rgba(11, 18, 32, 0.04);
+    --sh-2: 0 4px 12px -2px rgba(11, 18, 32, 0.06), 0 2px 4px -1px rgba(11, 18, 32, 0.04);
+    --sh-3: 0 12px 32px -8px rgba(11, 18, 32, 0.10), 0 4px 8px -2px rgba(11, 18, 32, 0.05);
+    --ease: cubic-bezier(0.22, 1, 0.36, 1);
+    --crit-r: #ef4444;
+    --crit-o: #f59e0b;
+    --crit-y: #eab308;
+    --crit-g: #22c55e;
 }
 
+/* ── App canvas ──────────────────────────────────────────────────────────── */
 .stApp {
-    background: linear-gradient(135deg, #f0f4f8 0%, #ffffff 100%) !important;
+    background: var(--bg) !important;
 }
-
 .block-container {
     padding-top: 2rem !important;
-    max-width: 1400px !important;
+    padding-bottom: 4rem !important;
+    max-width: 1320px !important;
 }
+#MainMenu, footer, header[data-testid="stHeader"] { display: none !important; }
 
 html, body, [class*="css"], .stMarkdown, p, span, label, li, div {
-    font-family: 'Plus Jakarta Sans', sans-serif !important;
-    color: #1e293b !important;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
+    color: var(--ink-2) !important;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
 }
 
 h1, h2, h3, h4 {
-    font-family: 'Outfit', sans-serif !important;
+    font-family: 'Inter', sans-serif !important;
     letter-spacing: -0.02em !important;
-    color: #0f172a !important;
-    font-weight: 800 !important;
+    color: var(--ink-1) !important;
+    font-weight: 700 !important;
 }
 
-/* Header */
-.hdr-container {
-    background: white;
-    border-radius: var(--radius-lg);
-    padding: 2rem 3rem;
-    margin-bottom: 2.5rem;
-    box-shadow: var(--shadow-elite);
-    border: 1px solid var(--border);
+@keyframes fadeUp { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+@keyframes fadeIn { from{opacity:0} to{opacity:1} }
+@keyframes softPulse {
+    0%,100% { opacity: 1; transform: scale(1); }
+    50%     { opacity: 0.55; transform: scale(0.92); }
+}
+
+/* ── HERO — minimalista, premium ─────────────────────────────────────────── */
+.hero {
+    position: relative;
+    overflow: hidden;
+    border-radius: var(--r-lg);
+    padding: 2.4rem 2.6rem;
+    margin: 0 0 1.5rem 0;
+    background:
+        radial-gradient(900px 320px at 100% 0%, rgba(187, 206, 0, 0.22) 0%, transparent 60%),
+        linear-gradient(135deg, #03281c 0%, #064a32 45%, #006a44 100%);
+    color: white !important;
+    box-shadow: 0 20px 40px -16px rgba(3, 40, 28, 0.35);
+    animation: fadeIn 0.4s var(--ease);
+}
+.hero-row {
+    position: relative;
+    z-index: 2;
     display: flex;
     align-items: center;
+    justify-content: space-between;
+    gap: 2rem;
+}
+.hero-left { display: flex; align-items: center; gap: 1.5rem; min-width: 0; flex: 1; }
+.hero-logo {
+    flex: 0 0 72px;
+    width: 72px; height: 72px;
+    border-radius: 18px;
+    background: #ffffff;
+    display: flex; align-items: center; justify-content: center;
+    padding: 12px;
+    box-shadow: 0 8px 24px -6px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,1);
+}
+.hero-logo img {
+    width: 100%; height: 100%;
+    object-fit: contain;
+    display: block;
+}
+.hero-text { min-width: 0; }
+.hero-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: rgba(187, 206, 0, 0.95) !important;
+    margin: 0 0 0.5rem 0;
+}
+.hero-tag .dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: #BBCE00;
+    animation: softPulse 2s ease-in-out infinite;
+}
+.hero-title {
+    font-size: 2.1rem;
+    font-weight: 700;
+    line-height: 1.05;
+    margin: 0;
+    color: #ffffff !important;
+    letter-spacing: -0.03em;
+}
+.hero-title em {
+    font-family: 'Instrument Serif', serif !important;
+    font-style: italic;
+    font-weight: 400;
+    color: #d8f5e6 !important;
+    letter-spacing: -0.01em;
+}
+.hero-date {
+    text-align: right;
+    color: rgba(255, 255, 255, 0.65) !important;
+    font-size: 0.78rem;
+    font-weight: 500;
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+.hero-date .day {
+    display: block;
+    font-family: 'Inter', sans-serif;
+    font-size: 1.6rem;
+    font-weight: 700;
+    color: #ffffff !important;
+    letter-spacing: -0.02em;
+    margin-bottom: 2px;
+    text-transform: none;
+}
+
+/* ── Sidebar ─────────────────────────────────────────────────────────────── */
+section[data-testid="stSidebar"] {
+    background: #ffffff !important;
+    border-right: 1px solid var(--line);
+}
+.panel-title {
+    font-size: 0.68rem;
+    font-weight: 700;
+    color: var(--ink-4) !important;
+    text-transform: uppercase;
+    letter-spacing: 1.8px;
+    margin: 0.8rem 0 1rem 0;
+}
+
+/* ── Metrics ─────────────────────────────────────────────────────────────── */
+div[data-testid="metric-container"] {
+    background: var(--card) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: var(--r-md) !important;
+    padding: 1.2rem 1.3rem !important;
+    box-shadow: var(--sh-1) !important;
+    transition: border-color 0.2s var(--ease), transform 0.2s var(--ease);
+}
+div[data-testid="metric-container"]:hover {
+    border-color: var(--line-2) !important;
+    transform: translateY(-2px);
+}
+div[data-testid="stMetricValue"] > div {
+    font-size: 2rem !important;
+    font-weight: 700 !important;
+    color: var(--ink-1) !important;
+    letter-spacing: -0.03em;
+    font-variant-numeric: tabular-nums;
+}
+div[data-testid="stMetricLabel"] > label {
+    font-size: 0.7rem !important;
+    font-weight: 600 !important;
+    color: var(--ink-4) !important;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+}
+
+/* ── Botón principal ─────────────────────────────────────────────────────── */
+div[data-testid="stButton"] > button {
+    background: linear-gradient(180deg, var(--brand) 0%, var(--brand-2) 100%) !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 12px !important;
+    padding: 0.9rem 1.6rem !important;
+    font-family: 'Inter', sans-serif !important;
+    font-weight: 600 !important;
+    font-size: 0.88rem !important;
+    letter-spacing: 0.3px;
+    width: 100% !important;
+    box-shadow: 0 6px 16px -6px rgba(0, 135, 81, 0.45),
+                inset 0 1px 0 rgba(255, 255, 255, 0.12) !important;
+    transition: transform 0.15s var(--ease), box-shadow 0.2s var(--ease) !important;
+}
+div[data-testid="stButton"] > button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 10px 22px -6px rgba(0, 135, 81, 0.5),
+                inset 0 1px 0 rgba(255, 255, 255, 0.15) !important;
+}
+div[data-testid="stButton"] > button:active { transform: translateY(0); }
+
+div[data-testid="stDownloadButton"] > button {
+    background: var(--ink-1) !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 12px !important;
+    padding: 0.85rem 1.6rem !important;
+    font-family: 'Inter', sans-serif !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.3px;
+    box-shadow: 0 4px 12px -3px rgba(11, 18, 32, 0.25) !important;
+    transition: transform 0.15s var(--ease) !important;
+}
+div[data-testid="stDownloadButton"] > button:hover { transform: translateY(-1px); }
+
+/* ── Expanders ───────────────────────────────────────────────────────────── */
+div[data-testid="stExpander"] {
+    background: var(--card) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: var(--r-md) !important;
+    margin-bottom: 0.6rem !important;
+    box-shadow: var(--sh-1) !important;
+    overflow: hidden;
+    transition: border-color 0.2s var(--ease);
+}
+div[data-testid="stExpander"]:hover { border-color: var(--line-2) !important; }
+div[data-testid="stExpander"] summary {
+    padding: 0.9rem 1.1rem !important;
+    font-weight: 600 !important;
+    font-size: 0.9rem;
+}
+.crit-graves     div[data-testid="stExpander"] { border-left: 3px solid var(--crit-r) !important; }
+.crit-relevantes div[data-testid="stExpander"] { border-left: 3px solid var(--crit-o) !important; }
+.crit-parciales  div[data-testid="stExpander"] { border-left: 3px solid var(--crit-y) !important; }
+.crit-ninguna    div[data-testid="stExpander"] { border-left: 3px solid var(--crit-g) !important; }
+
+/* ── Status dots — reemplazo profesional del semáforo emoji ───────────────── */
+.sdot {
+    display: inline-block;
+    width: 9px; height: 9px;
+    border-radius: 50%;
+    margin-right: 7px;
+    vertical-align: middle;
+    position: relative;
+    top: -1px;
+}
+.sdot-graves     { background: var(--crit-r); box-shadow: 0 0 0 3px rgba(239,68,68,0.15); }
+.sdot-relevantes { background: var(--crit-o); box-shadow: 0 0 0 3px rgba(245,158,11,0.15); }
+.sdot-parciales  { background: var(--crit-y); box-shadow: 0 0 0 3px rgba(234,179,8,0.15); }
+.sdot-ninguna    { background: var(--crit-g); box-shadow: 0 0 0 3px rgba(34,197,94,0.15); }
+/* Pill de criticidad para encabezados de subregión */
+.crit-pill {
+    display: inline-block;
+    font-size: 0.62rem;
+    font-weight: 700;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    padding: 3px 9px;
+    border-radius: 999px;
+    vertical-align: middle;
+}
+.pill-graves     { background: rgba(239,68,68,0.12); color: #b91c1c !important; }
+.pill-relevantes { background: rgba(245,158,11,0.14); color: #b45309 !important; }
+.pill-parciales  { background: rgba(234,179,8,0.16); color: #a16207 !important; }
+.pill-ninguna    { background: rgba(34,197,94,0.12); color: #15803d !important; }
+
+/* Acento superior en metric cards — toque institucional */
+div[data-testid="metric-container"] {
     position: relative;
     overflow: hidden;
 }
-.hdr-container::before {
+div[data-testid="metric-container"]::before {
     content: "";
     position: absolute;
-    top: 0; right: 0;
-    width: 360px; height: 100%;
-    background: radial-gradient(circle at 100% 0%, rgba(187, 206, 0, 0.18) 0%, transparent 70%);
-}
-.hdr-logo-box {
-    flex: 0 0 140px;
-    padding-right: 2.5rem;
-    border-right: 2px solid #f1f5f9;
-}
-.hdr-content {
-    padding-left: 2.5rem;
-    flex: 1;
-}
-.hdr-title {
-    font-size: 2.4rem;
-    font-weight: 800;
-    color: #0f172a !important;
-    margin: 0;
-    line-height: 1.05;
-}
-.hdr-sub {
-    font-size: 0.95rem;
-    color: #475569 !important;
-    margin-top: 0.6rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 2px;
-}
-.hdr-badge {
-    background: linear-gradient(135deg, #f8fafc 0%, #eef2f7 100%);
-    color: #0f172a !important;
-    padding: 10px 22px;
-    border-radius: 12px;
-    font-size: 0.9rem;
-    font-weight: 700;
-    margin-top: 1.2rem;
-    display: inline-block;
-    border: 1px solid #cbd5e1;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-}
-
-/* Sidebar */
-section[data-testid="stSidebar"] {
-    background: #ffffff !important;
-    border-right: 1px solid var(--border);
-}
-.panel-title {
-    font-size: 0.7rem;
-    font-weight: 800;
-    color: var(--brand);
-    text-transform: uppercase;
-    letter-spacing: 2px;
-    margin-bottom: 1.5rem;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--brand), var(--brand-light));
     opacity: 0.85;
 }
 
-/* Métricas */
-div[data-testid="metric-container"] {
-    background: #ffffff !important;
-    border: 1px solid var(--border) !important;
-    border-radius: var(--radius-md) !important;
-    padding: 1.5rem !important;
-    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05) !important;
-    transition: transform 0.2s ease, border-color 0.2s ease;
+/* ── Stat cards — resumen de criticidad (reemplaza st.metric con emoji) ──── */
+.stat-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0.75rem;
+    margin: 0.4rem 0 0.2rem 0;
 }
-div[data-testid="metric-container"]:hover {
-    transform: translateY(-4px);
-    border-color: var(--brand) !important;
+.stat-card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-top: 3px solid var(--sc, var(--brand));
+    border-radius: var(--r-md);
+    padding: 1.05rem 1.2rem;
+    box-shadow: var(--sh-1);
+    transition: transform 0.2s var(--ease), border-color 0.2s var(--ease);
 }
-div[data-testid="stMetricValue"] > div {
-    font-size: 2.5rem !important;
-    font-weight: 800 !important;
-    color: #0f172a !important;
-}
-div[data-testid="stMetricLabel"] > label {
-    font-size: 0.75rem !important;
-    font-weight: 700 !important;
-    color: #64748b !important;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-}
-
-/* Botón principal */
-div[data-testid="stButton"] > button {
-    background: linear-gradient(135deg, var(--brand) 0%, var(--brand-dark) 100%) !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 14px !important;
-    padding: 1rem 2rem !important;
-    font-weight: 700 !important;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    width: 100% !important;
-    box-shadow: 0 10px 20px rgba(0, 135, 81, 0.20) !important;
-    transition: all 0.3s ease !important;
-}
-div[data-testid="stButton"] > button:hover {
-    box-shadow: 0 15px 30px rgba(0, 135, 81, 0.35) !important;
-    transform: translateY(-2px);
-}
-
-/* Expanders con borde lateral coloreado */
-div[data-testid="stExpander"] {
-    background: white !important;
-    border: 1px solid var(--border) !important;
-    border-radius: var(--radius-md) !important;
-    margin-bottom: 0.9rem !important;
-    box-shadow: var(--shadow-elite) !important;
-    overflow: hidden;
-}
-.crit-graves     div[data-testid="stExpander"] { border-left: 6px solid var(--crit-red)    !important; }
-.crit-relevantes div[data-testid="stExpander"] { border-left: 6px solid var(--crit-orange) !important; }
-.crit-parciales  div[data-testid="stExpander"] { border-left: 6px solid var(--crit-yellow) !important; }
-.crit-ninguna    div[data-testid="stExpander"] { border-left: 6px solid var(--crit-green)  !important; }
-
-/* Tag fuente */
-.source-tag {
-    background: #f1f5f9;
-    color: var(--brand) !important;
-    padding: 4px 10px;
-    border-radius: 6px;
-    font-size: 0.7rem;
+.stat-card:hover { transform: translateY(-2px); border-color: var(--line-2); }
+.stat-num {
+    font-size: 2.1rem;
     font-weight: 700;
-    text-decoration: none;
-    border: 1px solid #e2e8f0;
-    transition: all 0.2s;
+    color: var(--ink-1) !important;
+    letter-spacing: -0.03em;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+}
+.stat-lab {
+    margin-top: 0.45rem;
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: var(--ink-4) !important;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    display: flex; align-items: center;
+}
+
+/* ── Source tag ──────────────────────────────────────────────────────────── */
+.source-tag {
+    background: #f5f7fa;
+    color: var(--brand) !important;
+    padding: 4px 9px;
+    border-radius: 6px;
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-decoration: none !important;
+    border: 1px solid var(--line);
+    transition: background 0.15s var(--ease), color 0.15s var(--ease);
     display: inline-block;
     margin: 2px 4px 2px 0;
 }
@@ -465,135 +779,172 @@ div[data-testid="stExpander"] {
     border-color: var(--brand);
 }
 
-/* Card de noticia (para el expander de verificación) */
+/* ── News card ───────────────────────────────────────────────────────────── */
 .news-card {
-    background: #f8fafc;
-    border: 1px solid var(--border);
-    border-left: 4px solid var(--brand);
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--brand);
     border-radius: 10px;
-    padding: 0.9rem 1.1rem;
-    margin-bottom: 0.6rem;
+    padding: 0.85rem 1rem;
+    margin-bottom: 0.55rem;
+    transition: border-color 0.15s var(--ease);
 }
+.news-card:hover { border-color: var(--line-2); border-left-color: var(--brand-light); }
 .news-meta {
-    font-size: 0.72rem;
-    color: var(--text-muted) !important;
-    font-weight: 600;
+    font-size: 0.7rem;
+    color: var(--ink-4) !important;
+    font-weight: 500;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    margin-bottom: 0.3rem;
+    margin-bottom: 0.35rem;
 }
 .news-title {
-    font-size: 0.95rem;
-    font-weight: 700;
-    color: #0f172a !important;
-    margin: 0 0 0.3rem 0;
-    line-height: 1.35;
+    font-size: 0.92rem;
+    font-weight: 600;
+    color: var(--ink-1) !important;
+    margin: 0 0 0.35rem 0;
+    line-height: 1.4;
+    letter-spacing: -0.005em;
 }
 .news-snippet {
-    font-size: 0.82rem;
-    color: var(--text-body) !important;
-    line-height: 1.5;
+    font-size: 0.8rem;
+    color: var(--ink-3) !important;
+    line-height: 1.55;
     margin: 0 0 0.5rem 0;
 }
 
-/* Checkboxes sidebar */
+/* ── Checkboxes ──────────────────────────────────────────────────────────── */
 div[data-testid="stCheckbox"] {
-    transition: all 0.2s ease;
     border-radius: 8px;
     padding: 2px 10px !important;
     margin-left: -10px !important;
     width: calc(100% + 20px) !important;
+    transition: background 0.15s var(--ease);
 }
-div[data-testid="stCheckbox"]:hover {
-    background: #f1f5f9 !important;
-    cursor: pointer;
-}
+div[data-testid="stCheckbox"]:hover { background: #f5f7fa !important; cursor: pointer; }
 div[data-testid="stCheckbox"] label p {
-    font-size: 0.85rem !important;
-    color: #475569 !important;
-}
-div[data-testid="stCheckbox"]:hover label p {
-    color: var(--brand) !important;
-    font-weight: 600 !important;
+    font-size: 0.82rem !important;
+    color: var(--ink-3) !important;
+    font-weight: 500;
 }
 
-/* Progress bar */
+/* ── Progress bar — sin shimmer infinito (perf) ──────────────────────────── */
+.stProgress > div > div {
+    background: var(--line) !important;
+    border-radius: 99px !important;
+    height: 6px !important;
+}
 .stProgress > div > div > div {
     background: linear-gradient(90deg, var(--brand), var(--brand-light)) !important;
-    height: 8px !important;
+    height: 6px !important;
+    border-radius: 99px !important;
+    transition: width 0.3s var(--ease);
 }
 
-/* Placeholder */
-.placeholder-card {
-    background: white;
-    border: 2px dashed var(--border);
-    border-radius: var(--radius-lg);
-    padding: 8rem 2rem;
+/* ── Placeholder — minimal ──────────────────────────────────────────────── */
+.placeholder {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    padding: 4.5rem 2rem;
     text-align: center;
-    box-shadow: var(--shadow-elite);
+    animation: fadeIn 0.3s var(--ease);
 }
-.placeholder-card div:first-child {
-    opacity: 0.85 !important;
+.placeholder-glyph {
+    width: 48px; height: 48px;
+    margin: 0 auto 1.4rem;
+    border-radius: 14px;
+    background: linear-gradient(135deg, rgba(0,135,81,0.08), rgba(187,206,0,0.10));
+    display: flex; align-items: center; justify-content: center;
+    color: var(--brand);
 }
-
-/* KPI strip — banner debajo del header */
-.kpi-strip {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 1rem;
-    margin-bottom: 1.5rem;
-}
-.kpi-card {
-    background: white;
-    border-radius: var(--radius-md);
-    padding: 1.2rem 1.4rem;
-    border: 1px solid var(--border);
-    box-shadow: 0 2px 4px rgba(0,0,0,0.03);
-    position: relative;
-    overflow: hidden;
-}
-.kpi-card::before {
-    content: "";
-    position: absolute;
-    left: 0; top: 0; bottom: 0;
-    width: 4px;
-    background: var(--brand);
-}
-.kpi-card.k-tier3::before { background: var(--brand); }
-.kpi-card.k-tier2::before { background: #0ea5e9; }
-.kpi-card.k-tier1::before { background: #64748b; }
-.kpi-card.k-cost::before  { background: var(--crit-green); }
-.kpi-label {
-    font-size: 0.7rem;
+.placeholder-glyph svg { width: 22px; height: 22px; }
+.placeholder h2 {
+    font-size: 1.3rem;
     font-weight: 700;
-    color: #64748b !important;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    margin-bottom: 0.4rem;
+    color: var(--ink-1) !important;
+    margin: 0 0 0.4rem 0;
+    letter-spacing: -0.02em;
 }
-.kpi-value {
-    font-size: 1.8rem;
-    font-weight: 800;
-    color: #0f172a !important;
-    line-height: 1;
-    font-family: 'Outfit', sans-serif;
-}
-.kpi-suffix {
-    font-size: 0.75rem;
-    color: var(--text-muted) !important;
-    margin-top: 0.3rem;
+.placeholder p {
+    color: var(--ink-4) !important;
+    font-size: 0.9rem;
+    margin: 0 auto;
+    max-width: 380px;
+    line-height: 1.55;
 }
 
-/* Section heading */
+/* ── Section heading ─────────────────────────────────────────────────────── */
 .section-h {
-    font-size: 1.1rem;
-    font-weight: 800;
-    color: #0f172a !important;
-    margin: 2rem 0 1rem 0;
-    padding-left: 0.8rem;
-    border-left: 4px solid var(--brand);
-    line-height: 1;
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--ink-4) !important;
+    margin: 2rem 0 0.9rem 0;
+    text-transform: uppercase;
+    letter-spacing: 1.6px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
 }
+.section-h::before {
+    content: "";
+    width: 16px; height: 2px;
+    background: var(--brand);
+    border-radius: 2px;
+}
+
+/* ── Alerts ──────────────────────────────────────────────────────────────── */
+div[data-testid="stAlert"] {
+    border-radius: 10px !important;
+    border: 1px solid var(--line) !important;
+    padding: 0.7rem 0.9rem !important;
+    font-size: 0.84rem !important;
+}
+
+/* ── Tabs ───────────────────────────────────────────────────────────────── */
+div[data-baseweb="tab-list"] {
+    gap: 2px !important;
+    border-bottom: 1px solid var(--line) !important;
+}
+button[data-baseweb="tab"] {
+    font-family: 'Inter', sans-serif !important;
+    font-weight: 600 !important;
+    font-size: 0.84rem !important;
+    color: var(--ink-4) !important;
+    padding: 9px 14px !important;
+}
+button[data-baseweb="tab"][aria-selected="true"] {
+    color: var(--brand) !important;
+    box-shadow: inset 0 -2px 0 var(--brand) !important;
+}
+
+/* ── Inputs ──────────────────────────────────────────────────────────────── */
+div[data-testid="stDateInput"] input,
+div[data-testid="stTextInput"] input {
+    border-radius: 10px !important;
+    border: 1px solid var(--line-2) !important;
+    background: white !important;
+    padding: 9px 12px !important;
+    font-size: 0.88rem !important;
+    transition: border-color 0.15s var(--ease), box-shadow 0.15s var(--ease);
+}
+div[data-testid="stDateInput"] input:focus,
+div[data-testid="stTextInput"] input:focus {
+    border-color: var(--brand) !important;
+    box-shadow: 0 0 0 3px rgba(0, 135, 81, 0.12) !important;
+}
+
+/* ── Footer ──────────────────────────────────────────────────────────────── */
+.brand-foot {
+    margin-top: 3.5rem;
+    padding: 1.2rem 0 0.5rem 0;
+    border-top: 1px solid var(--line);
+    text-align: center;
+    font-size: 0.72rem;
+    color: var(--ink-5) !important;
+    letter-spacing: 0.3px;
+}
+.brand-foot b { color: var(--ink-3) !important; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -604,26 +955,30 @@ div[data-testid="stCheckbox"]:hover label p {
 # Estadísticas de descarte por query (para diagnóstico)
 _SEARCH_STATS: dict[str, dict] = {}
 
-def buscar_noticias(query: str, tavily_key: str, max_resultados: int = 15, cat_label: str = "?") -> list[dict]:
+def buscar_noticias(query: str, tavily_key: str, max_resultados: int = 15, cat_label: str = "?") -> tuple[list[dict], dict]:
     """
-    Devuelve noticias filtradas con:
-      • Fecha real ≤ 72h (parsed de published_date o de URL; si no se puede, descarta).
+    Devuelve (noticias_filtradas, stats) — sub-query atómica.
+    Filtros aplicados:
+      • Fecha real ≤ 7 días (parsed de published_date o de URL; si no se puede, marca aprox).
       • Mención de Antioquia o algún municipio antioqueño.
+      • Anti-ruido Comfenalco (≥3 keywords de exclusión y sin señal crítica).
       • Dedupe por título normalizado.
       • Ranking por score compuesto numérico.
-    Registra estadísticas de descarte en _SEARCH_STATS[cat_label].
+    El caller agrega múltiples sub-queries en _SEARCH_STATS[categoría].
     """
-    stats = {"raw": 0, "no_basics": 0, "fecha_aprox": 0, "too_old": 0, "no_geo": 0, "dup": 0, "kept": 0}
+    stats = {"raw": 0, "no_basics": 0, "fecha_aprox": 0, "too_old": 0, "no_geo": 0, "ruido": 0, "dup": 0, "kept": 0}
     try:
         client = TavilyClient(api_key=tavily_key)
-        # topic="general" + time_range="week" → Tavily filtra por 7 días y respeta
-        # nuestros dominios. Sin fecha exacta confiamos en ese pre-filtro y penalizamos.
+        # topic="news" + days=7 → el índice de noticias de Tavily devuelve
+        # published_date de forma mucho más confiable que topic="general", lo que
+        # reduce drásticamente las noticias marcadas "fecha-aprox" (penalizadas) y
+        # mejora la frescura real del ranking. Mantiene include_domains (trust tiers).
         resp = client.search(
             query=query,
             search_depth="advanced",
             max_results=max_resultados * 3,
-            topic="general",
-            time_range="week",
+            topic="news",
+            days=7,
             include_domains=MEDIOS_COLOMBIANOS,
         )
 
@@ -666,7 +1021,11 @@ def buscar_noticias(query: str, tavily_key: str, max_resultados: int = 15, cat_l
                 stats["no_geo"] += 1
                 continue
 
-            texto_completo = f"{titulo} {resumen}"
+            # Filtro anti-ruido (farándula/deportes/política nacional sin valor)
+            if es_ruido_comfenalco(texto_completo):
+                stats["ruido"] += 1
+                continue
+
             tier = tier_de(url)
             sub_detectada   = detectar_subregion(texto_completo)
             criticidad_hint = detectar_criticidad_keywords(texto_completo)
@@ -709,13 +1068,11 @@ def buscar_noticias(query: str, tavily_key: str, max_resultados: int = 15, cat_l
         unicos.sort(key=lambda x: x["score_compuesto"], reverse=True)
         kept = unicos[:max_resultados]
         stats["kept"] = len(kept)
-        _SEARCH_STATS[cat_label] = stats
-        return kept
+        return kept, stats
 
     except Exception as e:
         st.warning(f"⚠️ Error Tavily ({cat_label}): {e}")
-        _SEARCH_STATS[cat_label] = stats
-        return []
+        return [], stats
 
 
 def formatear(resultados: list[dict], offset: int = 0) -> tuple[str, list[dict]]:
@@ -731,13 +1088,15 @@ def formatear(resultados: list[dict], offset: int = 0) -> tuple[str, list[dict]]
     for i, r in enumerate(resultados, start=1 + offset):
         sub_hint  = f" · 📍 SUBREGIÓN_DETECTADA={r['sub_detectada']}" if r.get("sub_detectada") else ""
         crit_hint = f" · 🎯 CRITICIDAD_SUGERIDA={r['criticidad_hint']}" if r.get("criticidad_hint") else ""
+        medio = nombre_medio(r["url"])
         lineas.append(
             f"[N{i}] ({r['fecha']}){sub_hint}{crit_hint}\n"
             f"     {r['titulo']}\n"
             f"     {r['resumen']}\n"
+            f"     📰 Medio: {medio}\n"
             f"     URL: {r['url']}"
         )
-        indexadas.append({**r, "id": i})
+        indexadas.append({**r, "id": i, "medio": medio})
     return "\n\n".join(lineas), indexadas
 
 
@@ -858,10 +1217,12 @@ def formatear_avisos_vigentes(avisos: list[dict], etiqueta: str, prefijo_id: str
         marca = "INDEFINIDO" if c["indefinido"] else f"VIGENTE HASTA {c['fecha_fin']}"
         sub_hint  = f" · 📍 SUBREGIÓN_DETECTADA={c['sub_detectada']}" if c.get("sub_detectada") else ""
         crit_hint = f" · 🎯 CRITICIDAD_SUGERIDA={c['criticidad_hint']}" if c.get("criticidad_hint") else ""
+        medio = nombre_medio(c["fuente"])
         lineas.append(
             f"[{prefijo_id}{i}] ⚠ {marca}{sub_hint}{crit_hint}\n"
             f"     {c['texto']}\n"
-            f"     Fuente oficial: {c['fuente']}"
+            f"     📰 Medio oficial: {medio}\n"
+            f"     URL: {c['fuente']}"
         )
     return "\n\n".join(lineas)
 
@@ -879,6 +1240,7 @@ def obtener_avisos_servicios_oficiales(tavily_key: str) -> tuple[str, list[dict]
         "https://www.epm.com.co/site/clientes/clientes-y-usuarios",
         "https://www.ungrd.gov.co/sala-de-prensa/comunicados",
         "https://www.ideam.gov.co/web/tiempo-y-clima/alertas-tempranas",
+        "https://alertastempranas.defensoria.gov.co/",
         "https://www.antioquia.gov.co/index.php/component/k2/itemlist/category/220-noticias",
         "https://www.medellin.gov.co",
     ]
@@ -949,11 +1311,45 @@ def obtener_noticias(tavily_key: str) -> dict:
       "url_to_cat": dict[str, str],     # url -> 'seg' | 'vias' | 'svc'
     }
     """
-    # Queries naturales (mayor recall que con frases exactas restrictivas)
+    # Queries Comfenalco: sub-queries cortas y naturales por categoría
+    # → Tavily prefiere queries cortas; usamos 3-4 ángulos por categoría para
+    #   cubrir distintos sub-temas y luego deduplicamos por URL.
     queries = [
-        ("seg",  "Antioquia orden público seguridad ataque armado desplazamiento toque de queda grupo armado"),
-        ("vias", "Antioquia vías cierre carretera derrumbe bloqueo movilidad INVÍAS Policía"),
-        ("svc",  "Antioquia corte agua energía EPM paro cívico servicios públicos comercio"),
+        ("seg", [
+            # Ángulo 1: orden público clásico — subregiones de mayor conflicto
+            "Antioquia Bajo Cauca Norte Nordeste orden público ataque armado desplazamiento grupo armado",
+            # Ángulo 2: sicariato y bandas criminales — Urabá y Valle de Aburrá
+            "Antioquia Urabá Medellín ataque sicarial homicidio Clan del Golfo consejo de seguridad",
+            # Ángulo 3: declaraciones y crisis — Norte/Occidente/Suroeste
+            "Antioquia Ituango Briceño Cañasgordas alerta roja toque de queda masacre desplazamiento familias",
+            # Ángulo 4: patrones recurrentes de violencia — Oriente y Nordeste
+            "Antioquia Oriente Nordeste ola homicidios asesinatos enfrentamientos bandas extorsión El Mesa",
+        ]),
+        ("vias", [
+            # Ángulo 1: cierres y eventos naturales
+            "Antioquia vías cierre carretera derrumbe deslizamiento bloqueo Urabá Bajo Cauca",
+            # Ángulo 2: obras, concesiones y rutas
+            "Antioquia carretera paso restringido Ruta Nacional INVÍAS concesión obras Túnel La Llorona",
+            # Ángulo 3: alertas IDEAM y movilidad
+            "Antioquia movilidad alerta IDEAM lluvia río Cauca creciente puente afectación vía",
+        ]),
+        ("svc", [
+            # Ángulo 1: servicios públicos EPM
+            "Antioquia corte agua energía EPM servicio público paro cívico",
+            # Ángulo 2: cortes programados y mantenimiento
+            "Antioquia interrupción servicio mantenimiento programado EPM Aguas",
+            # Ángulo 3: alertas oficiales con impacto comunitario
+            "Antioquia alerta temprana Defensoría UNGRD comunidad afectación",
+        ]),
+        ("sed", [
+            # Sedes, hoteles y parques de Comfenalco Antioquia (col 4)
+            # Ángulo 1: instalaciones Comfenalco directas
+            "Comfenalco Antioquia sede parque hotel servicio afectación cierre",
+            # Ángulo 2: parques recreativos y turismo regional
+            "Antioquia parque recreativo turismo cierre clausura emergencia",
+            # Ángulo 3: hoteles y alojamiento turístico
+            "Antioquia hotel alojamiento turismo afectación servicio cierre",
+        ]),
     ]
 
     bloques_texto = {}
@@ -962,11 +1358,39 @@ def obtener_noticias(tavily_key: str) -> dict:
     offset = 0
     _SEARCH_STATS.clear()
 
-    for i, (cat, q) in enumerate(queries):
-        if i > 0:
-            time.sleep(0.5)  # respetar rate-limit
-        crudos = buscar_noticias(q, tavily_key, cat_label=cat)
-        texto, indexadas = formatear(crudos, offset=offset)
+    primera = True
+    for cat, sub_queries in queries:
+        # Acumulador por categoría
+        cat_results: dict[str, dict] = {}  # url → noticia (dedupe)
+        cat_stats = {"raw": 0, "no_basics": 0, "fecha_aprox": 0, "too_old": 0,
+                     "no_geo": 0, "ruido": 0, "dup": 0, "kept": 0, "sub_queries": 0}
+
+        for sq in sub_queries:
+            if not primera:
+                time.sleep(0.4)  # respetar rate-limit Tavily
+            primera = False
+            crudos, sub_stats = buscar_noticias(
+                sq, tavily_key,
+                max_resultados=12,
+                cat_label=f"{cat}/sub",
+            )
+            cat_stats["sub_queries"] += 1
+            for k, v in sub_stats.items():
+                if k in cat_stats:
+                    cat_stats[k] += v
+            # Dedupe por URL preservando el de mayor score compuesto
+            for c in crudos:
+                u = c["url"]
+                if u not in cat_results or c["score_compuesto"] > cat_results[u]["score_compuesto"]:
+                    cat_results[u] = c
+
+        # Re-ranking final por score compuesto, top 15
+        unicos = sorted(cat_results.values(),
+                        key=lambda x: x["score_compuesto"], reverse=True)[:15]
+        cat_stats["kept"] = len(unicos)
+        _SEARCH_STATS[cat] = cat_stats
+
+        texto, indexadas = formatear(unicos, offset=offset)
         bloques_texto[cat] = texto
         todas_indexadas.extend(indexadas)
         for it in indexadas:
@@ -1016,6 +1440,7 @@ def obtener_noticias(tavily_key: str) -> dict:
         "texto_seg":   bloques_texto["seg"],
         "texto_vias":  bloques_texto["vias"],
         "texto_svc":   bloques_texto["svc"],
+        "texto_sed":   bloques_texto.get("sed", "(Sin noticias específicas de sedes/hoteles/parques)"),
         "indexadas":   todas_indexadas,
         "url_to_cat":  url_to_cat,
         "urls_oficiales_vias": urls_oficiales,
@@ -1028,22 +1453,27 @@ def obtener_noticias(tavily_key: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 #  IA: Groq Llama 3.3 70B
 # ══════════════════════════════════════════════════════════════════════════════
-def construir_prompt(seg: str, vias: str, svc: str, fecha: str) -> str:
+def construir_prompt(seg: str, vias: str, svc: str, sed: str, fecha: str) -> str:
     lista = "\n".join(f"  • {s}: {', '.join(m[:5])}" for s, m in SUBREGIONES.items())
-    return f"""Eres el analista de seguridad y movilidad de Comfenalco Antioquia. Fecha: {fecha}.
+    return f"""Eres el analista de seguridad y movilidad de Comfenalco Antioquia.
+Fecha del informe: {fecha}.
 
 SUBREGIONES Y MUNICIPIOS DE ANTIOQUIA:
 {lista}
 
-REGLAS CRÍTICAS (NO LAS VIOLES):
-A. Solo usa noticias que mencionen explícitamente Antioquia o un municipio antioqueño.
-   Si una noticia habla de otra región (Bogotá, Cali, Cundinamarca, Valle, etc.) y NO
-   menciona Antioquia ni un municipio antioqueño → IGNÓRALA por completo.
-B. No inventes datos. Si una subregión no tiene noticias, escribe "SIN NOVEDAD".
-C. No mezcles información de distintas noticias en una misma frase si no son del mismo hecho.
-D. Para cada celda con contenido, devuelve las URLs específicas usadas en el campo
+═══════════════════════════════════════════════════════════════════════════════
+REGLAS CRÍTICAS (NO LAS VIOLES)
+═══════════════════════════════════════════════════════════════════════════════
+A. Solo usa noticias que mencionen explícitamente Antioquia o un municipio
+   antioqueño. Si una noticia habla de otra región (Bogotá, Cali, Cundinamarca,
+   Valle, etc.) y NO menciona Antioquia ni un municipio antioqueño → IGNÓRALA.
+B. NO inventes datos. Si una subregión no tiene noticias para una categoría,
+   escribe EXACTAMENTE: SIN NOVEDAD
+C. No mezcles información de distintas noticias en una misma frase si no son
+   del mismo hecho. Mejor sepáralas con doble salto de línea.
+D. Para cada celda con contenido, devuelve las URLs reales usadas en el campo
    "fuentes_*" correspondiente (copia textual de las URLs presentes en el contexto).
-E. ⚠ DISTINCIÓN CRÍTICA — TIPOS DE DATO:
+E. DISTINCIÓN CRÍTICA — TIPOS DE DATO:
    • NOTICIAS (medios) → tienen fecha de publicación; ya fueron filtradas a 72h.
    • AVISOS OFICIALES VIGENTES (cierres viales, cortes de servicios programados,
      alertas IDEAM/UNGRD) → tienen ventana de validez (Inicio → Fin) o marca de
@@ -1057,11 +1487,122 @@ E. ⚠ DISTINCIÓN CRÍTICA — TIPOS DE DATO:
      • Obras programadas / paso restringido / corte corto con horario / alerta amarilla → PARCIALES
 
    Reglas de propagación entre celdas:
-     • Un AVISO_SERVICIO de corte de agua o energía debe aparecer en Comercio/Servicios
-       Y TAMBIÉN en Sedes/Hoteles/Parques de la subregión afectada.
-     • Un CIERRE_VIAL grave que aísle un municipio puede elevar también la celda de
-       Comercio/Servicios a RELEVANTES (impacto sobre actividad económica).
+     • Un AVISO_SERVICIO de corte de agua o energía debe aparecer en
+       Comercio/Servicios Y TAMBIÉN en Sedes/Hoteles/Parques de la subregión.
+     • Un CIERRE_VIAL grave que aísle un municipio puede elevar también la celda
+       de Comercio/Servicios a RELEVANTES (impacto sobre actividad económica).
 
+═══════════════════════════════════════════════════════════════════════════════
+ESTILO DE REDACCIÓN — TONO COMFENALCO (CRÍTICO, IMITAR EXACTO)
+═══════════════════════════════════════════════════════════════════════════════
+Comfenalco redacta este informe en estilo telegráfico profesional, denso en
+datos y orientado a decisión operativa. Imita ESTE estilo en cada celda.
+
+ESTRUCTURA DE CADA NOTA:
+  [MARCADOR TEMPORAL opcional] [MUNICIPIO O VÍA en MAYÚSCULAS]: [hecho concreto
+  con cifras y actores]. [Medidas: ... cuando aplique]. Fuente: [Nombre del medio].
+
+MARCADORES TEMPORALES (en MAYÚSCULAS al inicio cuando aplique):
+  • SEGUIMIENTO — hechos en curso desde hace días que merecen monitoreo continuo.
+  • CONTINÚA — afectaciones vigentes, especialmente cierres viales que llevan días.
+  • ALERTA — cuando hay declaración formal (alerta roja/naranja/amarilla).
+  • (sin marcador) — hecho NUEVO de las últimas 72h.
+
+EJEMPLOS REALES DEL CLIENTE (estudia y replica el tono y la densidad de datos):
+
+— ORDEN PÚBLICO —
+  «BRICEÑO: 86 familias desplazadas, ataques con explosivos, amenazas y multas
+  a los campesinos, hacen que el municipio en este momento esté en alerta roja.
+  Medidas: toque de queda y ley seca.»
+
+  «YARUMAL: Ante el ataque sicarial en local comercial de Yarumal por un ajuste
+  de cuentas con el Clan del Golfo, convocan de manera urgente a un consejo de
+  seguridad, para tomar medidas de seguridad en el municipio.
+  Fuente: Alerta Paisa y Teleantioquia.»
+
+  «Oriente Antioqueño: Se mantiene una alerta por el incremento de homicidios
+  derivados de enfrentamientos entre el Clan del Golfo y El Mesa, reportan en
+  las últimas semanas 20 eventos aproximadamente. Fuente: Diarioriente.»
+
+— VÍAS Y MOVILIDAD —
+  «SEGUIMIENTO. Vía Nechí – Caucasia: Desde ayer presenta cierres intermitentes,
+  específicamente en el sector de Colorado. Por parte del gremio de mineros.
+  Fuente: Policía Nacional.»
+
+  «CONTINÚA Cierre parcial – Ruta Nacional 2511 (Los Llanos – Tarazá).
+  Tramo: PR 29+0530 al PR 31+000.
+  Motivo: Obras de infraestructura y seguridad vial.
+  Horarios de cierre: 09:00 a 15:00 / 20:00 a 05:00 del día siguiente.»
+
+  «CONTINÚA Paso a un carril Dabeiba – Mutatá (sector Túnel La Llorona).
+  Motivo: labores de mantenimiento y atención de puntos críticos.
+  Fuente: Concesión Autopistas Urabá.»
+
+  «CONTINÚA cierre total Vía Necoclí – Puerto Rey. Policía Nacional (DITRA) y
+  reportes de INVÍAS confirman cierre por evento natural (daños en puentes y
+  afectaciones por lluvias).»
+
+— COMERCIO / SERVICIOS —
+  «CONTINÚA. ITAGÜÍ: Más de 130 familias de la vereda El Porvenir, se quedaron
+  sin servicio de agua potable luego de que vandalizaran la planta de tratamiento;
+  la recuperación de la planta podría tardar cerca de ocho días.»
+
+— SEDES / HOTELES / PARQUES —
+  «CAÑAS GORDAS: Se presentará hoy interrupción de energía de 09:00 a 16:00 horas,
+  por labores de mantenimiento. Zona urbana, rural y corregimientos.
+  Fuente: La Noticia.»
+
+REGLAS DE REDACCIÓN (basadas en los ejemplos anteriores):
+  R1. Inicia cada nota con MUNICIPIO en MAYÚSCULAS (o nombre de vía), seguido
+      de dos puntos. Si varios municipios de la subregión están afectados por
+      el mismo hecho, agrúpalos en una sola nota.
+  R2. Incluye SIEMPRE las cifras concretas que estén en el contexto: número de
+      familias, víctimas, eventos, días, hectáreas, horarios. NO redondees, NO
+      inventes. Si el dato no está, no lo pongas.
+  R3. Identifica actores por nombre si aparecen en el contexto: «Clan del Golfo»,
+      «El Mesa», «gremio de mineros», nombres de empresas, etc. NO inventes nombres.
+  R4. Cierra con «Medidas: ...» cuando el contexto mencione decisiones tomadas
+      (toque de queda, consejo de seguridad, ley seca, evacuación, militarización).
+  R5. ⚠ FUENTES VERÍDICAS — REGLA CRÍTICA DE TRAZABILIDAD ⚠
+      Cierra con «Fuente: <Nombre del medio>». El nombre DEBE coincidir EXACTAMENTE
+      con el "📰 Medio:" que aparece junto al item que usaste. NO inventes nombres.
+      NO uses "fuentes propias", "redes sociales", "según testigos" — cada hecho
+      debe trazar a un medio listado en el contexto.
+      Si combinas información de dos items en una sola nota: «Fuente: X y Y» listando ambos.
+      Las URLs van en el campo "fuentes_*" del JSON — DEBEN ser las URLs exactas
+      de los items que citaste con "Fuente: ..." en el texto. No omitas ninguna.
+      Ejemplos del mapping nombre→dominio para que veas el patrón:
+        "Alerta Paisa"          → alerta.com.co
+        "Teleantioquia"         → teleantioquia.co
+        "Diariente"             → diarioriente.com
+        "Minuto30"              → minuto30.com
+        "H13 Noticias"          → h13n.com
+        "Conexión Sur"          → conexionsur.co
+        "El Colombiano"         → elcolombiano.com
+        "Policía Nacional"      → policia.gov.co
+        "INVÍAS" / "INVÍAS Viajero" → invias.gov.co / invias-viajero.vercel.app
+        "EPM"                   → epm.com.co
+        "IDEAM"                 → ideam.gov.co
+        "UNGRD"                 → ungrd.gov.co
+        "Defensoría — Alertas Tempranas" → alertastempranas.defensoria.gov.co
+        "Gobernación de Antioquia" → antioquia.gov.co
+  R6. Para VÍAS: usa formato «Vía A – B» (guion largo –) seguido del tipo de
+      afectación: «Cierre total», «Cierre parcial», «Paso a un carril»,
+      «Paso restringido», «Cierres intermitentes». Añade Tramo (PR si lo hay),
+      Motivo y Horarios si están en el contexto, en líneas separadas.
+  R7. Para SERVICIOS PÚBLICOS: menciona barrio/vereda/zona, horario exacto
+      («09:00 a 16:00»), duración estimada y motivo. Si afecta agua o energía
+      en un municipio → propaga la nota TAMBIÉN a Sedes/Hoteles/Parques.
+  R8. Si una subregión tiene varios hechos en la misma categoría, sepáralos con
+      DOBLE salto de línea (\\n\\n) — NO los mezcles en un solo párrafo.
+  R9. Longitud objetivo por nota: 2–5 líneas. Densas, no rellenadas.
+  R10. Tono: telegráfico, neutro, profesional. NO uses adjetivos emocionales
+       («terrible», «espantoso»). NO uses primera persona. NO uses futuro
+       especulativo («podría suceder») salvo que el contexto lo diga textualmente.
+
+═══════════════════════════════════════════════════════════════════════════════
+CONTEXTO RECOPILADO
+═══════════════════════════════════════════════════════════════════════════════
 ─── SEGURIDAD / ORDEN PÚBLICO ───
 {seg}
 
@@ -1071,28 +1612,36 @@ E. ⚠ DISTINCIÓN CRÍTICA — TIPOS DE DATO:
 ─── SERVICIOS PÚBLICOS Y COMERCIO ───
 {svc}
 
-INSTRUCCIONES DE REDACCIÓN:
-1. Asigna cada noticia/aviso a la subregión correspondiente. SI el item ya viene
-   con la etiqueta "📍 SUBREGIÓN_DETECTADA=X", úsala directamente — el sistema ya
-   la pre-detectó por mención de municipio. NO la cambies salvo evidencia clara.
-   Si NO trae esa etiqueta, asigna por el municipio mencionado.
+─── SEDES, HOTELES Y PARQUES (Comfenalco Antioquia) ───
+{sed}
+
+═══════════════════════════════════════════════════════════════════════════════
+INSTRUCCIONES DE PROCESAMIENTO
+═══════════════════════════════════════════════════════════════════════════════
+1. Asigna cada noticia/aviso a la subregión correspondiente. SI el item ya
+   viene con etiqueta "📍 SUBREGIÓN_DETECTADA=X", úsala directamente — el
+   sistema ya la pre-detectó por mención de municipio. NO la cambies salvo
+   evidencia clara. Si NO trae esa etiqueta, asigna por el municipio mencionado.
 2. Si un item trae "🎯 CRITICIDAD_SUGERIDA=X", úsala como punto de partida y
    AJÚSTALA solo si tu análisis del texto justifica otro nivel.
-3. Si hay información: redacta 4-5 líneas con municipio, qué pasó, magnitud,
-   medidas tomadas y estado actual. Sé específico, no genérico. SIEMPRE menciona
-   explícitamente el nombre del municipio en el texto.
-3. Sin información para la categoría/subregión → escribe exactamente: SIN NOVEDAD
-4. Criticidad por categoría:
-   GRAVES     = toque de queda / desplazamiento masivo / cierre total vía / ataque armado grave con víctimas
-   RELEVANTES = alerta de seguridad / paso a un carril / corte prolongado de servicios / afectación parcial
-   PARCIALES  = seguimiento / obra programada / alerta preventiva / corte corto con horario definido
+3. Si hay información: redacta SIGUIENDO EL ESTILO COMFENALCO de los ejemplos.
+4. Sin información para la categoría/subregión → escribe exactamente: SIN NOVEDAD
+5. Criticidad por categoría:
+   GRAVES     = toque de queda / desplazamiento masivo / cierre total vía /
+                ataque armado grave con víctimas / alerta roja
+   RELEVANTES = alerta de seguridad / paso a un carril / corte prolongado
+                de servicios / afectación parcial / alerta naranja
+   PARCIALES  = SEGUIMIENTO / obra programada / alerta preventiva /
+                corte corto con horario definido / alerta amarilla
    NINGUNA    = sin novedad
-5. La criticidad_general de la subregión = la más alta entre sus 4 categorías.
-6. En los campos "fuentes_*" devuelve SOLO URLs presentes en el contexto que SÍ usaste
-   para esa categoría/subregión. Si no usaste ninguna → arreglo vacío [].
+6. La criticidad_general de la subregión = la más alta entre sus 4 categorías.
+7. En los campos "fuentes_*" devuelve SOLO URLs presentes en el contexto que SÍ
+   usaste para esa categoría/subregión. Si no usaste ninguna → arreglo vacío [].
 
-DEVUELVE SOLO ESTE JSON, sin texto antes ni después. Cada subregión debe tener exactamente
-estas claves:
+═══════════════════════════════════════════════════════════════════════════════
+DEVUELVE SOLO ESTE JSON, sin texto antes ni después. Cada subregión debe tener
+exactamente estas claves:
+═══════════════════════════════════════════════════════════════════════════════
 {{
   "BAJO CAUCA": {{
     "municipio_principal": "",
@@ -1209,7 +1758,8 @@ def analizar(groq_key: str, contexto: dict, fecha: str) -> dict:
     _DEGRADACIONES = []  # reset por corrida
     client = Groq(api_key=groq_key)
     prompt = construir_prompt(
-        contexto["texto_seg"], contexto["texto_vias"], contexto["texto_svc"], fecha
+        contexto["texto_seg"], contexto["texto_vias"], contexto["texto_svc"],
+        contexto["texto_sed"], fecha,
     )
     urls_validas = set(contexto["url_to_cat"].keys())
     ultimo_error = None
@@ -1458,41 +2008,29 @@ hoy = datetime.now()
 
 st.logo("https://i.imgur.com/RFdkaOo.png")
 
-st.markdown(f"""
-<div class="hdr-container">
-    <div class="hdr-logo-box">
-        <img src="https://i.imgur.com/RFdkaOo.png" style="width: 100%; max-height: 70px; object-fit: contain;">
-    </div>
-    <div class="hdr-content">
-        <h1 class="hdr-title">Informe Diario Regional</h1>
-        <p class="hdr-sub">Seguridad · Movilidad · Comfenalco Antioquia</p>
-        <div class="hdr-badge">📅 {fecha_espanol(hoy)}</div>
-    </div>
-</div>
-""", unsafe_allow_html=True)
+# Logo oficial de Comfenalco
+_LOGO_URL = "https://i.imgur.com/RFdkaOo.png"
 
-# KPI strip — visibilidad inmediata del sistema
+_fecha_completa = fecha_espanol(hoy)
+_dia_num = f"{hoy.day:02d}"
+_mes_anio = _fecha_completa.split(' DE ')[1] if ' DE ' in _fecha_completa else _fecha_completa
+
 st.markdown(f"""
-<div class="kpi-strip">
-    <div class="kpi-card k-tier3">
-        <div class="kpi-label">Fuentes oficiales</div>
-        <div class="kpi-value">{len(FUENTES_OFICIALES)}</div>
-        <div class="kpi-suffix">Tier 3 · gov.co</div>
-    </div>
-    <div class="kpi-card k-tier2">
-        <div class="kpi-label">Medios verificados</div>
-        <div class="kpi-value">{len(MEDIOS_NACIONALES) + len(MEDIOS_REGIONALES)}</div>
-        <div class="kpi-suffix">Tier 2 + Tier 1</div>
-    </div>
-    <div class="kpi-card">
-        <div class="kpi-label">Ventana de noticias</div>
-        <div class="kpi-value">72h</div>
-        <div class="kpi-suffix">Rolling window</div>
-    </div>
-    <div class="kpi-card k-cost">
-        <div class="kpi-label">Costo operativo</div>
-        <div class="kpi-value">$0</div>
-        <div class="kpi-suffix">USD / mes</div>
+<div class="hero">
+    <div class="hero-row">
+        <div class="hero-left">
+            <div class="hero-logo">
+                <img src="{_LOGO_URL}" alt="Comfenalco">
+            </div>
+            <div class="hero-text">
+                <div class="hero-tag"><span class="dot"></span> Comfenalco Antioquia</div>
+                <h1 class="hero-title">Informe <em>Diario Regional</em></h1>
+            </div>
+        </div>
+        <div class="hero-date">
+            <span class="day">{_dia_num}</span>
+            {_mes_anio}
+        </div>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -1500,46 +2038,41 @@ st.markdown(f"""
 izq, der = st.columns([1, 2.3], gap="large")
 
 with izq:
-    st.markdown('<p class="panel-title">⚙️ CONFIGURACIÓN</p>', unsafe_allow_html=True)
+    st.markdown('<p class="panel-title">Configuración</p>', unsafe_allow_html=True)
 
     try:
         groq_key = st.secrets["GROQ_API_KEY"]
-        st.success("✅ Groq configurado")
+        st.success("Groq configurado")
     except Exception:
-        groq_key = st.text_input("🔑 Groq API Key", type="password",
+        groq_key = st.text_input("Groq API Key", type="password",
                                   placeholder="gsk_...",
                                   help="Gratis en console.groq.com")
 
     try:
         tavily_key = st.secrets["TAVILY_API_KEY"]
-        st.success("✅ Tavily configurado")
+        st.success("Tavily configurado")
     except Exception:
-        tavily_key = st.text_input("🔍 Tavily API Key", type="password",
+        tavily_key = st.text_input("Tavily API Key", type="password",
                                     placeholder="tvly-...",
                                     help="Gratis en app.tavily.com")
 
-    fecha_informe = st.date_input("📅 Fecha del informe", value=hoy)
+    fecha_informe = st.date_input("Fecha del informe", value=hoy)
 
     st.markdown("---")
-    st.markdown('<p class="panel-title">📍 SUBREGIONES</p>', unsafe_allow_html=True)
+    st.markdown('<p class="panel-title">Subregiones</p>', unsafe_allow_html=True)
     seleccion = {sub: st.checkbox(sub, value=True, key=f"chk_{sub}") for sub in SUBREGIONES}
 
     n_activas = sum(seleccion.values())
-    st.markdown("---")
-    st.markdown(f"""
-    <div style="font-size:0.8rem; color:var(--text-muted); line-height:1.8; background:#f8fafc; padding:1.2rem; border-radius:12px; border:1px solid var(--border)">
-        📡 Subregiones: <b style="color:var(--brand)">{n_activas}</b><br>
-        ⏱️ Tiempo: ~60 seg<br>
-        🛡️ Fuentes oficiales: <b style="color:var(--brand)">{len(FUENTES_OFICIALES)}</b><br>
-        📰 Medios verificados: <b style="color:var(--brand)">{len(MEDIOS_NACIONALES) + len(MEDIOS_REGIONALES)}</b><br>
-        🤖 IA: Groq · Llama 3.3<br>
-        💰 Costo: <b style="color:var(--brand)">$0.00</b>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="font-size:0.78rem;color:var(--ink-4);margin-top:0.8rem;'
+        f'padding:0.4rem 0;letter-spacing:0.2px">'
+        f'<b style="color:var(--brand);font-weight:600">{n_activas}</b> '
+        f'de {len(SUBREGIONES)} subregiones activas</div>',
+        unsafe_allow_html=True,
+    )
 
 with der:
-    st.markdown('<p class="panel-title">🚀 ACCIÓN</p>', unsafe_allow_html=True)
-    generar = st.button(" GENERAR INFORME AUTOMÁTICO", use_container_width=True)
+    generar = st.button("Generar informe", use_container_width=True)
 
     if generar:
         if not groq_key or not tavily_key:
@@ -1550,20 +2083,20 @@ with der:
         barra  = st.progress(0)
         estado = st.empty()
 
-        estado.markdown("🔍 **Buscando en medios colombianos…** (filtrando últimas 72h y mención de Antioquia)")
+        estado.markdown("**Buscando en medios colombianos…** (últimos 7 días, mención de Antioquia)")
         barra.progress(15)
         contexto = obtener_noticias(tavily_key)
         barra.progress(45)
 
-        estado.markdown("🤖 **Analizando y redactando con IA…** Groq · Llama 3.3 70B")
+        estado.markdown("**Analizando y redactando con IA…** Groq · Llama 3.3 70B")
         datos = analizar(groq_key, contexto, fecha_str)
         datos = {s: datos[s] for s in SUBREGIONES if seleccion.get(s) and s in datos}
         barra.progress(85)
 
-        estado.markdown("📊 **Generando Excel…**")
+        estado.markdown("**Generando Excel…**")
         excel_buf = construir_excel(datos, fecha_str)
         barra.progress(100)
-        estado.markdown("✅ **Informe listo**")
+        estado.markdown("**Informe listo**")
 
         # ── Métricas ──
         st.markdown("---")
@@ -1572,11 +2105,20 @@ with der:
             cg = d.get("criticidad_general", "NINGUNA")
             conteo[cg] = conteo.get(cg, 0) + 1
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("🔴 Graves",      conteo["GRAVES"])
-        m2.metric("🟠 Relevantes",  conteo["RELEVANTES"])
-        m3.metric("🟡 Parciales",   conteo["PARCIALES"])
-        m4.metric("🟢 Sin novedad", conteo["NINGUNA"])
+        _stat_meta = [
+            ("GRAVES",     "Graves",      "graves",     "var(--crit-r)"),
+            ("RELEVANTES", "Relevantes",  "relevantes", "var(--crit-o)"),
+            ("PARCIALES",  "Parciales",   "parciales",  "var(--crit-y)"),
+            ("NINGUNA",    "Sin novedad", "ninguna",    "var(--crit-g)"),
+        ]
+        _cards = "".join(
+            f'<div class="stat-card" style="--sc:{color}">'
+            f'<div class="stat-num">{conteo[k]}</div>'
+            f'<div class="stat-lab"><span class="sdot sdot-{slug}"></span>{lab}</div>'
+            f'</div>'
+            for k, lab, slug, color in _stat_meta
+        )
+        st.markdown(f'<div class="stat-grid">{_cards}</div>', unsafe_allow_html=True)
 
         # ── Avisos oficiales vigentes (modelo bitemporal, distintos a noticias 72h) ──
         cierres_activos   = contexto.get("cierres_activos", [])
@@ -1622,9 +2164,9 @@ with der:
         # ── Noticias fuente (cards) ──
         n_total = len(contexto["indexadas"])
         with st.expander(f"🔎 Ver noticias fuente ({n_total} verificadas, últimas 72h)"):
-            t1, t2, t3 = st.tabs(["🚨 Seguridad", "🛣️ Vías", "🏪 Servicios"])
-            cat_label = {"seg": t1, "vias": t2, "svc": t3}
-            por_cat = {"seg": [], "vias": [], "svc": []}
+            t1, t2, t3, t4 = st.tabs(["🚨 Seguridad", "🛣️ Vías", "🏪 Servicios", "🏨 Sedes/Hoteles"])
+            cat_label = {"seg": t1, "vias": t2, "svc": t3, "sed": t4}
+            por_cat = {"seg": [], "vias": [], "svc": [], "sed": []}
             for it in contexto["indexadas"]:
                 por_cat[contexto["url_to_cat"].get(it["url"], "seg")].append(it)
 
@@ -1670,13 +2212,15 @@ with der:
             # Stats de búsqueda Tavily — cuántas trajo, cuántas cayeron y por qué
             if _SEARCH_STATS:
                 st.markdown("**Búsqueda Tavily por categoría** (raw → descartes → kept):")
-                cat_nombre = {"seg": "🚨 Seguridad", "vias": "🛣️ Vías", "svc": "🏪 Servicios"}
+                cat_nombre = {"seg": "🚨 Seguridad", "vias": "🛣️ Vías", "svc": "🏪 Servicios", "sed": "🏨 Sedes/Hoteles"}
                 for cat, s in _SEARCH_STATS.items():
                     nombre = cat_nombre.get(cat, cat)
                     st.markdown(
-                        f"- **{nombre}** — Tavily devolvió **{s['raw']}** resultados · "
+                        f"- **{nombre}** — Tavily devolvió **{s['raw']}** resultados "
+                        f"({s.get('sub_queries', 1)} sub-queries) · "
                         f"descartes: viejos **{s.get('too_old', 0)}**, "
                         f"sin-Antioquia **{s.get('no_geo', 0)}**, "
+                        f"ruido/farándula **{s.get('ruido', 0)}**, "
                         f"duplicados **{s.get('dup', 0)}**, "
                         f"basura **{s.get('no_basics', 0)}** · "
                         f"~ fecha-aprox **{s.get('fecha_aprox', 0)}** (aceptados con penalización) · "
@@ -1701,7 +2245,7 @@ with der:
                 )
 
         # ── Resumen por subregión (cards con borde coloreado) ──
-        st.markdown('<div class="section-h">📋 Resumen de Novedades por Subregión</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-h">Resumen de Novedades por Subregión</div>', unsafe_allow_html=True)
         crit_class = {
             "GRAVES":     "crit-graves",
             "RELEVANTES": "crit-relevantes",
@@ -1710,33 +2254,35 @@ with der:
         }
         for sub, d in datos.items():
             crit    = d.get("criticidad_general", "NINGUNA")
-            emoji   = SEMAFORO.get(crit, "⚪")
             mun     = d.get("municipio_principal", "")
-            label   = LABELS_CRIT.get(crit, "")
 
             st.markdown(f'<div class="{crit_class.get(crit, "")}">', unsafe_allow_html=True)
-            with st.expander(f"{emoji}  {sub}  ·  {mun}  ·  {label}"):
+            with st.expander(f"{sub}   ·   {mun}   ·   {LABELS_CRIT.get(crit, '')}"):
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.markdown(f"**🚨 Orden Público** {SEMAFORO.get(d.get('orden_publico_crit','NINGUNA'),'')}")
+                    oc = d.get('orden_publico_crit', 'NINGUNA')
+                    st.markdown(f"{dot(oc)}**Orden Público**", unsafe_allow_html=True)
                     st.caption(d.get("orden_publico", "SIN NOVEDAD"))
                     if d.get("fuentes_orden_publico"):
                         for u in d["fuentes_orden_publico"]:
                             st.markdown(f'<a href="{u}" target="_blank" class="source-tag">↗ {u[:50]}…</a>', unsafe_allow_html=True)
 
-                    st.markdown(f"**🛣️ Vías** {SEMAFORO.get(d.get('vias_crit','NINGUNA'),'')}")
+                    vc = d.get('vias_crit', 'NINGUNA')
+                    st.markdown(f"{dot(vc)}**Vías**", unsafe_allow_html=True)
                     st.caption(d.get("vias", "SIN NOVEDAD"))
                     if d.get("fuentes_vias"):
                         for u in d["fuentes_vias"]:
                             st.markdown(f'<a href="{u}" target="_blank" class="source-tag">↗ {u[:50]}…</a>', unsafe_allow_html=True)
                 with c2:
-                    st.markdown(f"**🏪 Comercio / Servicios** {SEMAFORO.get(d.get('comercio_crit','NINGUNA'),'')}")
+                    cc = d.get('comercio_crit', 'NINGUNA')
+                    st.markdown(f"{dot(cc)}**Comercio / Servicios**", unsafe_allow_html=True)
                     st.caption(d.get("comercio_servicios", "SIN NOVEDAD"))
                     if d.get("fuentes_comercio"):
                         for u in d["fuentes_comercio"]:
                             st.markdown(f'<a href="{u}" target="_blank" class="source-tag">↗ {u[:50]}…</a>', unsafe_allow_html=True)
 
-                    st.markdown(f"**🏢 Sedes / Hoteles** {SEMAFORO.get(d.get('sedes_crit','NINGUNA'),'')}")
+                    sc = d.get('sedes_crit', 'NINGUNA')
+                    st.markdown(f"{dot(sc)}**Sedes / Hoteles**", unsafe_allow_html=True)
                     st.caption(d.get("sedes_hoteles", "SIN NOVEDAD"))
                     if d.get("fuentes_sedes"):
                         for u in d["fuentes_sedes"]:
@@ -1756,11 +2302,21 @@ with der:
 
     else:
         st.markdown("""
-        <div class="placeholder-card">
-            <div style="font-size:4rem; margin-bottom:1.5rem; opacity:0.2">📡</div>
-            <h2 style="color:#0f172a; margin:0; font-weight:800">Sistema en Espera</h2>
-            <p style="color:#64748b; font-size:1.1rem; margin-top:0.8rem; max-width:420px; margin-left:auto; margin-right:auto;">
-               Selecciona la fecha y subregiones, luego pulsa <b>Generar Informe Automático</b>.
-            </p>
+        <div class="placeholder">
+            <div class="placeholder-glyph">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="11" cy="11" r="8"/>
+                    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                </svg>
+            </div>
+            <h2>Listo para generar</h2>
+            <p>Pulsa <b style="color:var(--brand);font-weight:600">Generar informe</b> en el panel lateral para iniciar el rastreo.</p>
         </div>
         """, unsafe_allow_html=True)
+
+# ── Footer ───────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="brand-foot">
+    <b>Comfenalco Antioquia</b> · Informe Diario Regional
+</div>
+""", unsafe_allow_html=True)
